@@ -63,6 +63,13 @@ FROM dataproduct
 WHERE taskmanager_id = (select  max(sequence_id) from taskmanager where name = %s)
 """
 
+SELECT_LAST_GENERATION_ID_BY_NAME1 = """
+SELECT max(dp.generation_id) as generation_id
+FROM dataproduct dp
+JOIN taskmanager tm ON dp.taskmanager_id=tm.sequence_id
+WHERE tm.name=%s
+"""
+
 SELECT_LAST_GENERATION_ID_BY_NAME_AND_ID = """
 SELECT max(dp.generation_id)
 FROM dataproduct dp
@@ -145,6 +152,7 @@ class Postgresql(ds.DataSource):
                 return self._select_dictresult(SELECT_TASKMANAGER_BY_NAME_AND_ID,
                                                (taskmanager_name, taskmanager_id))[0]
             except IndexError:
+                self.logger.exception("DB probe = SELECT_TASKMANAGER_BY_NAME_AND_ID Taskmanager={} not found".format(taskmanager_name))
                 raise KeyError("Taskmanager={} taskmanager_id={} not found".format(
                     taskmanager_name, taskmanager_id))
         else:
@@ -152,6 +160,7 @@ class Postgresql(ds.DataSource):
                 return self._select_dictresult(SELECT_TASKMANAGER_BY_NAME,
                                                (taskmanager_name,))[0]
             except IndexError:
+                self.logger.exception("DB probe = SELECT_TASKMANAGER_BY_NAME Taskmanager={} not found".format(taskmanager_name))
                 raise KeyError(
                     "Taskmanager={} not found".format(taskmanager_name))
 
@@ -200,17 +209,24 @@ class Postgresql(ds.DataSource):
                 assert generation_id
                 return generation_id
             except AssertionError:
+                self.logger.exception("DB probe = SELECT_LAST_GENERATION_ID_BY_NAME_AND_ID Last generation id not found for taskmanager={} taskmanager_id={}".
+                                      format(taskmanager_name, taskmanager_id))
                 raise KeyError("Last generation id not found for taskmanager={} taskmanager_id={}".
                                format(taskmanager_name, taskmanager_id))
         else:
             try:
                 generation_id = self._select(SELECT_LAST_GENERATION_ID_BY_NAME,
                                              (taskmanager_name, ))[0][0]
+                generation_id1 = self._select(SELECT_LAST_GENERATION_ID_BY_NAME1,
+                                              (taskmanager_name, ))[0][0]
                 assert generation_id
+                assert generation_id == generation_id1
                 return generation_id
             except AssertionError:
-                raise KeyError("Last generation id not found for taskmanager={}".
-                               format(taskmanager_name, ))
+                self.logger.exception("DB probe = SELECT_LAST_GENERATION_ID_BY_NAME Last generation id not found for taskmanager={} (generation_id={}, generation_id1={})".
+                                      format(taskmanager_name, generation_id, generation_id1))
+                raise KeyError("Last generation id not found for taskmanager={} (generation_id={}, generation_id1={})".
+                               format(taskmanager_name, generation_id, generation_id1))
 
     def insert(self, taskmanager_id, generation_id, key,
                value, header, metadata):
@@ -243,38 +259,54 @@ class Postgresql(ds.DataSource):
 
     def update(self, taskmanager_id, generation_id, key,
                value, header, metadata):
+        for table in (ds.DataSource.header_table, ds.DataSource.metadata_table,
+                      ds.DataSource.dataproduct_table):
+            q = SELECT_QUERY.format(table)
+            try:
+                self._select(q, (taskmanager_id, generation_id, key))[0]
+            except IndexError:
+                self.logger.exception("DB probe = exception in update verification - taskmanager_id={} or generation_id={} or key={} not found in {}".format(
+                                      taskmanager_id, generation_id, key, table))
+                # # do not log stack trace, Exception thrown is handled by the caller
+                # raise KeyError("taskmanager_id={} or generation_id={} or key={} not found in {}".format(
+                #    taskmanager_id, generation_id, key, table))
+        try:
+            # MM Wrapping update to inspect exceptions
+            q = """
+                UPDATE {} SET value=%s
+                          WHERE taskmanager_id=%s AND generation_id=%s AND key=%s
+                """.format(ds.DataSource.dataproduct_table)
 
-        q = """
-            UPDATE {} SET value=%s
+            self._update(q, (psycopg2.Binary(value),
+                             taskmanager_id, generation_id, key))
+
+            q = """
+            UPDATE {} SET create_time=%s,
+                          expiration_time=%s,
+                          scheduled_create_time=%s,
+                          creator=%s,
+                          schema_id=%s
                       WHERE taskmanager_id=%s AND generation_id=%s AND key=%s
-            """.format(ds.DataSource.dataproduct_table)
+                """.format(ds.DataSource.header_table)
+            self._update(q, (header.get('create_time'),
+                             header.get('expiration_time'),
+                             header.get('scheduled_create_time'),
+                             header.get('creator'), header.get('schema_id'),
+                             taskmanager_id, generation_id, key))
 
-        self._update(q, (psycopg2.Binary(value),
-                         taskmanager_id, generation_id, key))
-
-        q = """
-        UPDATE {} SET create_time=%s,
-                      expiration_time=%s,
-                      scheduled_create_time=%s,
-                      creator=%s,
-                      schema_id=%s
-                  WHERE taskmanager_id=%s AND generation_id=%s AND key=%s
-            """.format(ds.DataSource.header_table)
-        self._update(q, (header.get('create_time'),
-                         header.get('expiration_time'),
-                         header.get('scheduled_create_time'),
-                         header.get('creator'), header.get('schema_id'),
-                         taskmanager_id, generation_id, key))
-
-        q = """
-             UPDATE {} SET state=%s,
-                           generation_time=%s,
-                           missed_update_count=%s
-                        WHERE taskmanager_id=%s AND generation_id=%s AND key=%s
-            """.format(ds.DataSource.metadata_table)
-        self._update(q, (metadata.get('state'), metadata.get('generation_time'),
-                         metadata.get('missed_update_count'),
-                         taskmanager_id, generation_id, key))
+            q = """
+                 UPDATE {} SET state=%s,
+                               generation_time=%s,
+                               missed_update_count=%s
+                            WHERE taskmanager_id=%s AND generation_id=%s AND key=%s
+                """.format(ds.DataSource.metadata_table)
+            self._update(q, (metadata.get('state'), metadata.get('generation_time'),
+                             metadata.get('missed_update_count'),
+                             taskmanager_id, generation_id, key))
+        except Exception:
+            # log the exception for debug
+            self.logger.exception("DB probe = exception in update")
+            raise
 
     def get_header(self, taskmanager_id, generation_id, key):
         q = SELECT_QUERY.format(ds.DataSource.header_table)
@@ -451,8 +483,12 @@ class Postgresql(ds.DataSource):
                 cursor.execute(query_string, values)
             else:
                 cursor.execute(query_string)
+            updated_rows = cursor.rowcount
             db.commit()
+            if updated_rows == 0:
+                self.logger.exception("DB probe - No row updated, No record found: ({}, {})".format(query_string, values))
         except psycopg2.Error:
+            self.logger.exception("DB probe - exception during _update()")
             try:
                 if db:
                     db.rollback()
